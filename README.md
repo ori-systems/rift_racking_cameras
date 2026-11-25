@@ -16,7 +16,8 @@ Open the monitor at **115200 baud** and enter commands at the `rift>` prompt.
 | `net-static <ip> <netmask> [gateway]` | Saves a fixed IPv4 address, mask, and optional gateway. |
 | `net-dhcp` | Clears the fixed address and restores DHCP. |
 | `ntp-server <pc-ip>` | Saves the IPv4 address of the NTP server. |
-| `ntp-server off` | Clears the saved NTP server. |
+| `ntp-server auto` | Uses the NTP server supplied by DHCP option 42. |
+| `ntp-server off` | Turns off clock sync. |
 | `time` | Shows the current UTC time after sync, or reports that the clock is still waiting. |
 
 Commands that change a setting save it to flash and restart the board. The settings survive power cycles.
@@ -44,6 +45,8 @@ For an isolated cable between the PC and the board, give them different addresse
 A working link with no DHCP address usually means the network lacks a reachable DHCP server. Check the router or use fixed addresses for a direct cable.
 
 ## Sync with the PC clock
+
+The board defaults to automatic NTP discovery when no server setting is saved. The DHCP server must advertise an NTP address in option 42. When it does, the board logs `NTP server from DHCP: <ip>`. A saved server address takes precedence. Use `ntp-server auto` to switch back to discovery. On a direct cable with a fixed IP, set the server address manually.
 
 The board starts asking for the time after Ethernet has an IPv4 address. To use the PC as its time source, enable the PC's NTP server and allow the board to reach it on **UDP port 123**. On Windows, see the [Windows Time service settings](https://learn.microsoft.com/en-us/windows-server/networking/windows-time-service/windows-time-service-tools-and-settings?tabs=config) for the `NtpServer` provider.
 

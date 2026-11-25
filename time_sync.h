@@ -31,6 +31,12 @@ esp_err_t time_sync_start(void);
 esp_err_t time_sync_save_server(const char *address);
 
 /*
+ * @brief Save automatic NTP discovery for the next boot.
+ * @return ESP_OK on success or an NVS error code.
+*/
+esp_err_t time_sync_save_dhcp(void);
+
+/*
  * @brief Read UTC after the board has received the time from its NTP server.
  * @param now Output for the current UTC time since the Unix epoch.
  * @return True when a synced time was read.

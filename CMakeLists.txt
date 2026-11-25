@@ -5,11 +5,12 @@ set(IDF_TARGET esp32p4 CACHE STRING "ESP-IDF target")
 set(SDKCONFIG "${CMAKE_BINARY_DIR}/sdkconfig")
 set(SDKCONFIG_DEFAULTS "${CMAKE_BINARY_DIR}/sdkconfig.defaults")
 
-# Use the ROM bootloader for flashing and enable IPv4 ping replies.
+# Use the ROM bootloader and enable IPv4 ping and DHCP time servers.
 file(CONFIGURE OUTPUT "${SDKCONFIG_DEFAULTS}" CONTENT [=[
 CONFIG_ESPTOOLPY_NO_STUB=y
 CONFIG_LWIP_IPV4=y
 CONFIG_LWIP_ICMP=y
+CONFIG_LWIP_DHCP_GET_NTP_SRV=y
 ]=])
 
 # Components and application

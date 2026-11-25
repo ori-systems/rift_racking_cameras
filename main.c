@@ -111,7 +111,7 @@ static int command_net_dhcp(int argc, char **argv)
 /*
  * @brief Save the NTP server for the next time the board starts.
  * @param argc Number of arguments, including the command name.
- * @param argv Command name followed by an IPv4 address or off.
+ * @param argv Command name followed by an IPv4 address, auto, or off.
  * @return 1 for invalid input or failure to save.
 */
 static int command_ntp_server(int argc, char **argv)
@@ -119,16 +119,29 @@ static int command_ntp_server(int argc, char **argv)
     // Check that the user gave us one setting to save.
     if (argc != 2)
     {
-        // Show how to choose a server or turn sync off.
-        printf("Usage: ntp-server <pc-ip|off>\n");
+        // Show the ways the user can choose a time server.
+        printf("Usage: ntp-server <pc-ip|auto|off>\n");
         // Stop before trying to read a missing value.
         return 1;
     }
 
-    // Use no address when the user wants to turn sync off.
-    const char *address = strcmp(argv[1], "off") == 0 ? NULL : argv[1];
-    // Save the choice so it is still there when the board restarts.
-    esp_err_t err = time_sync_save_server(address);
+    // Read the server setting the user typed.
+    const char *setting = argv[1];
+    // Leave room for the result of saving the setting.
+    esp_err_t err;
+    // Check whether the network should supply the NTP server.
+    if (strcmp(setting, "auto") == 0)
+    {
+        // Save automatic discovery so it is used after restart.
+        err = time_sync_save_dhcp();
+    }
+    else
+    {
+        // Leave out an address when the user wants to turn sync off.
+        const char *address = strcmp(setting, "off") == 0 ? NULL : setting;
+        // Save the address or off setting so it survives a restart.
+        err = time_sync_save_server(address);
+    }
     // Check that saving worked before restarting.
     if (err != ESP_OK)
     {
@@ -225,9 +238,9 @@ static esp_err_t start_uart_console(void)
             // Use this name to choose which computer sets the clock.
             .command = "ntp-server",
             // Describe the command in the help list.
-            .help = "Save an NTP server and restart",
+            .help = "Choose an NTP server, automatic discovery, or off, then restart",
             // Show which values can be entered.
-            .hint = "<pc-ip|off>",
+            .hint = "<pc-ip|auto|off>",
             // Run this function to save the choice.
             .func = command_ntp_server,
         },
