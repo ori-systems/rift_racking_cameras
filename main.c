@@ -8,9 +8,11 @@
 /* Includes */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
+#include "camera.h"
 #include "esp_console.h"
 #include "esp_log.h"
 #include "esp_system.h"
@@ -36,6 +38,21 @@ static const ethernet_config_t ethernet_pins =
     .crs_dv_gpio = 28,
     .rxd0_gpio = 29,
     .rxd1_gpio = 30,
+};
+
+/* Waveshare ESP32-P4-ETH camera wiring and startup settings. */
+static const camera_config_t camera_config =
+{
+    .sda_gpio = 7,
+    .scl_gpio = 8,
+    .reset_gpio = -1,
+    .power_down_gpio = -1,
+    .port = 8080,
+    .mode =
+    {
+        .width = 1920,
+        .height = 1080,
+    },
 };
 
 /* UART commands */
@@ -208,7 +225,90 @@ static int command_time(int argc, char **argv)
 }
 
 /*
- * @brief Register network commands and start the UART console.
+ * @brief Read or change the live camera resolution over UART.
+ * @param argc Number of arguments, including the command name.
+ * @param argv Command name followed by optional width and height.
+ * @return 0 if the request succeeded or 1 if it could not be used.
+*/
+static int command_camera_settings(int argc, char **argv)
+{
+    // Check whether the user asked to see the current settings.
+    if (argc == 1)
+    {
+        // Read the picture size the stream is set to use.
+        const camera_mode_t mode = camera_stream_get_mode();
+        // Check whether the camera was able to start.
+        if (mode.width == 0)
+        {
+            // Point the user to the camera startup messages on this console.
+            printf("Camera unavailable. Check the startup log.\n");
+            // Report that there are no settings to show.
+            return 1;
+        }
+        // Print the values in the same order as the command accepts them.
+        printf("Camera resolution: %u x %u\n", mode.width, mode.height);
+        // Finish after showing the settings.
+        return 0;
+    }
+
+    // Require both dimensions when changing the resolution.
+    if (argc != 3)
+    {
+        // Show the right order for the two numbers.
+        printf("Usage: camera-settings [<width> <height>]\n");
+        // Stop before reading any missing arguments.
+        return 1;
+    }
+
+    // Leave room for both numbers after the command name.
+    uint16_t values[2];
+    // Read the width and height in order.
+    for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); ++i)
+    {
+        // Read one argument as a decimal number.
+        const char *number = argv[i + 1];
+        // Reject signs, spaces and other characters that are not digits.
+        if (number[0] == '\0' || number[strspn(number, "0123456789")] != '\0')
+        {
+            // Show why the setting could not be read.
+            printf("Camera settings need whole numbers.\n");
+            // Keep the current settings.
+            return 1;
+        }
+        // Convert the digits to a number.
+        const unsigned long value = strtoul(number, NULL, 10);
+        // Prevent a large input from wrapping to a smaller number.
+        if (value > UINT16_MAX)
+        {
+            // Show why the number was rejected.
+            printf("Camera setting is out of range.\n");
+            // Keep the current settings.
+            return 1;
+        }
+        // Keep this value to pass to the camera.
+        values[i] = (uint16_t)value;
+    }
+
+    // Ask the camera to apply both dimensions together.
+    const camera_mode_t mode = { .width = values[0], .height = values[1] };
+    // Let the camera check the mode before the stream uses it.
+    const esp_err_t err = camera_stream_set_mode(mode);
+    // Check whether the new settings were accepted.
+    if (err != ESP_OK)
+    {
+        // Give the reason so the user can correct the setting.
+        printf("Camera settings rejected (%s).\n", esp_err_to_name(err));
+        // Let the console know the command failed.
+        return 1;
+    }
+    // Confirm the settings the streaming task will use.
+    printf("Camera resolution requested: %u x %u\n", mode.width, mode.height);
+    // Finish without restarting the board.
+    return 0;
+}
+
+/*
+ * @brief Register network and camera commands and start the UART console.
  * @return ESP_OK on success or an ESP-IDF error code.
 */
 static esp_err_t start_uart_console(void)
@@ -251,6 +351,16 @@ static esp_err_t start_uart_console(void)
             .help = "Show the synced UTC time",
             // Run this function to read the clock.
             .func = command_time,
+        },
+        {
+            // Use this name to show or change the stream settings.
+            .command = "camera-settings",
+            // Describe both ways to use the command.
+            .help = "Show or change the camera resolution",
+            // Show which numbers can follow the command.
+            .hint = "[<width> <height>]",
+            // Run this function to handle the user's request.
+            .func = command_camera_settings,
         },
     };
 
@@ -307,7 +417,7 @@ static esp_err_t start_uart_console(void)
 /* Application entry point */
 
 /*
- * @brief Start the board's Ethernet interface and independent UART console.
+ * @brief Start Ethernet, the camera stream, and the UART console.
 */
 void app_main(void)
 {
@@ -327,6 +437,15 @@ void app_main(void)
     {
         // Show the network error so it can be fixed from the console.
         ESP_LOGE(TAG, "Ethernet startup failed (%s)", esp_err_to_name(err));
+    }
+
+    // Make the live camera stream available over Ethernet.
+    err = camera_stream_start(&camera_config);
+    // Check whether the camera and its server could start.
+    if (err != ESP_OK)
+    {
+        // Show the problem on UART so a cable or sensor issue can be found.
+        ESP_LOGE(TAG, "Camera startup failed (%s)", esp_err_to_name(err));
     }
 
     // Start the serial console even if Ethernet is down.

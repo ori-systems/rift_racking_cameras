@@ -19,8 +19,10 @@ Open the monitor at **115200 baud** and enter commands at the `rift>` prompt.
 | `ntp-server auto` | Uses the NTP server supplied by DHCP option 42. |
 | `ntp-server off` | Turns off clock sync. |
 | `time` | Shows the current UTC time after sync, or reports that the clock is still waiting. |
+| `camera-settings` | Shows the requested camera resolution. |
+| `camera-settings <width> <height>` | Changes the camera resolution while the board is running. |
 
-Commands that change a setting save it to flash and restart the board. The settings survive power cycles.
+Ethernet and NTP settings are saved to flash and take effect after a restart. Camera settings take effect on the running board and return to the defaults in `main.c` when the board restarts.
 
 ## Ethernet and ping
 
@@ -57,3 +59,24 @@ ntp-server 192.168.50.1
 ```
 
 After restart, wait for `Clock synced to 192.168.50.1`, then enter `time`. The output is UTC and ends with `Z`. If the board keeps waiting, ping the board first, verify the saved server address, and check that the PC is serving NTP to the board. See the [ESP-IDF time synchronization guide](https://docs.espressif.com/projects/esp-idf/en/stable/esp32p4/api-reference/system/system_time.html) for how the firmware's clock is set.
+
+## Live camera preview
+
+The firmware captures from the camera over MIPI CSI and uses the ESP32-P4 hardware to encode JPEGs.
+
+```powershell
+python -m pip install opencv-python
+python view_camera.py 192.168.70.10
+```
+
+The viewer uses `http://192.168.70.10:8080/stream`. Press `Q` or `Esc` to close it. The firmware captures frames while the viewer is connected and frees the frame buffers when it closes.
+
+### Change resolution
+
+The `.mode` in `main.c` sets the startup resolution. The firmware includes **800×640**, **800×800**, **800×1280** and **1920×1080** sensor modes. To switch to 1080p, enter this on UART.
+
+```text
+camera-settings 1920 1080
+```
+
+Changing resolution briefly pauses the picture while the camera restarts capture. Frames are sent as fast as the board and Ethernet connection can handle them. For the JPEG stream, the UART log reports the average times for capture, encoding, and TCP writes after the first 30 frames at each resolution.
