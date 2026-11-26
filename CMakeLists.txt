@@ -24,6 +24,11 @@ CONFIG_CAMERA_OV5647=n
 CONFIG_CAMERA_IMX708=y
 CONFIG_CAMERA_IMX708_AUTO_DETECT_MIPI_INTERFACE_SENSOR=y
 CONFIG_CAMERA_IMX708_MIPI_IF_FORMAT_INDEX_DEFAULT=0
+CONFIG_CAM_MOTOR_DW9807=y
+CONFIG_CAM_MOTOR_DW9807_AUTO_DETECT=y
+CONFIG_ESP_IPA_AF_ALGORITHM=y
+CONFIG_ESP_VIDEO_ENABLE_CAMERA_MOTOR_CONTROLLER=y
+CONFIG_ESP_VIDEO_ISP_PIPELINE_CONTROL_CAMERA_MOTOR=y
 ]=])
     set(imx_dependency "  mushbraindave/esp_cam_sensor_imx: \"0.4.0\"")
     set(imx_tuning "managed_components/mushbraindave__esp_cam_sensor_imx/sensors/imx708/cfg/imx708_default.json")
@@ -74,6 +79,7 @@ endif()
 idf_build_get_property(app EXECUTABLE)
 target_sources(${app} PRIVATE main.c ethernet.c time_sync.c camera.c camera_zenoh.c ssh_console.c)
 target_compile_options(${app} PRIVATE -ffunction-sections -fdata-sections)
+target_link_options(${app} PRIVATE -Wl,--wrap=esp_ipa_pipeline_process)
 
 # Build the pinned Zenoh-Pico ESP-IDF backend with TCP and large-frame fragmentation.
 include(FetchContent)

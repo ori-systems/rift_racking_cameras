@@ -41,6 +41,9 @@ Open the monitor at **115200 baud** and enter commands at the `rift>` prompt.
 | `camera-zenoh topic <suffix>` | Saves the part of the ROS topic after the camera ID. |
 | `camera-settings` | Shows the requested camera resolution. |
 | `camera-settings <width> <height>` | Changes the camera resolution while the board is running. |
+| `camera-autofocus [on\|off]` | Shows the lens position or starts and stops autofocus on the IMX708. |
+| `camera-white-balance [auto\|presets\|<preset>\|<red-gain> <blue-gain>]` | Shows, lists, or changes white balance. |
+| `camera-exposure [auto\|<microseconds>]` | Shows the shutter time and its range, or changes it. |
 
 Ethernet, NTP, and Zenoh settings are saved to flash and take effect after a restart. Resolution changes take effect on the running board and return to the default in `main.c` when the board restarts.
 
@@ -91,7 +94,7 @@ Set `CAMERA_SENSOR` in `main.c` to match the camera connected to the CSI port, t
 | Raspberry Pi Camera (B) | `CAMERA_SENSOR_OV5647` | 800×640, 800×800, 800×1280, 1920×1080 |
 | Raspberry Pi Camera Module 3 | `CAMERA_SENSOR_IMX708` (default) | 640×480, 800×600, 1024×768, 1280×720, 1920×1080 |
 
-Camera Module 3 connects to the 22-pin CSI port with a 15-to-22-pin Raspberry Pi camera cable. The firmware uses the [IMX camera driver for ESP32-P4](https://components.espressif.com/components/mushbraindave/esp_cam_sensor_imx/versions/0.4.0/readme) with automatic exposure and white balance. Autofocus is disabled.
+Camera Module 3 connects to the 22-pin CSI port with a 15-to-22-pin Raspberry Pi camera cable. The firmware uses the [IMX camera driver for ESP32-P4](https://components.espressif.com/components/mushbraindave/esp_cam_sensor_imx/versions/0.4.0/readme) with automatic exposure, automatic white balance, and a controllable focus motor.
 
 ### Change resolution
 
@@ -102,6 +105,28 @@ camera-settings 1920 1080
 ```
 
 Changing resolution briefly pauses the picture while the camera restarts capture. Frames are sent as fast as the board and Ethernet connection can handle them. The UART log reports average times for capture, encoding, and transport writes after the first 30 frames at each resolution.
+
+### Focus, white balance, and exposure
+
+Run these commands from either the SSH prompt or UART.
+
+```text
+camera-autofocus on
+camera-autofocus off
+camera-white-balance presets
+camera-white-balance daylight
+camera-white-balance blue
+camera-white-balance 1.35 1.80
+camera-white-balance auto
+camera-exposure 8000
+camera-exposure auto
+```
+
+Autofocus is off at startup. Turning it on starts a contrast-based search on the IMX708. Turning it off holds the current lens position.
+
+The fixed white-balance presets are `daylight`, `cloudy`, `tungsten`, `fluorescent`, and `blue`. The lighting presets are starting points based on [Raspberry Pi's IMX708 tuning](https://github.com/raspberrypi/libcamera/blob/main/src/ipa/rpi/vc4/data/imx708.json). The `blue` preset gives the picture a cooler look. Manual gains range from 0.5 to 4.0, where 1.0 leaves that color channel at its original strength.
+
+Fixed exposure uses the sensor's supported shutter range and pauses automatic gain adjustment. Use each command without arguments to see its settings. Changes apply during capture and reset to startup defaults when the board restarts.
 
 ## ROS 2 camera stream
 

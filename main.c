@@ -7,6 +7,7 @@
 
 /* Includes */
 
+#include <inttypes.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -376,6 +377,245 @@ static int command_camera_settings(int argc, char **argv)
     return 0;
 }
 
+/*
+ * @brief Report a camera control error on the caller's console.
+ * @param err Error from the camera module.
+ * @return 1 to mark the command as failed.
+*/
+static int camera_control_error(esp_err_t err)
+{
+    // Give the caller the same error over UART and SSH.
+    command_printf("Camera control rejected (%s).\n", esp_err_to_name(err));
+    return 1;
+}
+
+/*
+ * @brief Read or change whether the IMX708 focuses automatically.
+ * @param argc Number of arguments in the command.
+ * @param argv Command name and optional on or off value.
+ * @return 0 on success or 1 on error.
+*/
+static int command_camera_autofocus(int argc, char **argv)
+{
+    // Accept one optional setting and check its spelling.
+    if (argc == 2 && (strcmp(argv[1], "on") == 0 || strcmp(argv[1], "off") == 0))
+    {
+        // Ask the camera to hold its lens still or start a fresh scan.
+        const esp_err_t err = camera_set_autofocus(strcmp(argv[1], "on") == 0);
+        if (err != ESP_OK)
+        {
+            return camera_control_error(err);
+        }
+    }
+    else if (argc != 1)
+    {
+        command_printf("Usage: camera-autofocus [on|off]\n");
+        return 1;
+    }
+    // Report the current choice and the most recent lens position.
+    camera_controls_t controls;
+    const esp_err_t err = camera_get_controls(&controls);
+    if (err != ESP_OK)
+    {
+        return camera_control_error(err);
+    }
+    if (!controls.focus_available)
+    {
+        return camera_control_error(ESP_ERR_NOT_SUPPORTED);
+    }
+    command_printf("Autofocus: %s (lens position %" PRIu32 ")\n",
+                   controls.autofocus ? "on" : "off", controls.focus_position);
+    return 0;
+}
+
+/* Fixed gains based on the Raspberry Pi IMX708 tuning, plus a cooler look. */
+static const struct
+{
+    const char *name;
+    float red;
+    float blue;
+} white_balance_presets[] =
+{
+    { "daylight", 2.39f, 1.58f },
+    { "cloudy", 2.68f, 1.46f },
+    { "tungsten", 1.52f, 2.46f },
+    { "fluorescent", 1.96f, 1.86f },
+    { "blue", 1.85f, 2.20f },
+};
+
+/*
+ * @brief Show the available named white-balance gains.
+*/
+static void list_white_balance_presets(void)
+{
+    // Print the names from the same list that accepts them as commands.
+    command_printf("White balance presets:");
+    for (size_t i = 0; i < sizeof(white_balance_presets) / sizeof(white_balance_presets[0]); ++i)
+    {
+        command_printf(" %s", white_balance_presets[i].name);
+    }
+    command_printf("\n");
+}
+
+/*
+ * @brief Read or set automatic, preset, or manual white balance.
+ * @param argc Number of arguments in the command.
+ * @param argv Command name and optional auto, preset name, or two gain values.
+ * @return 0 on success or 1 on error.
+*/
+static int command_camera_white_balance(int argc, char **argv)
+{
+    // Use a pair of zero gains for automatic white balance.
+    float red = 0.0f;
+    float blue = 0.0f;
+    const size_t preset_count = sizeof(white_balance_presets) / sizeof(white_balance_presets[0]);
+    if (argc == 3)
+    {
+        // Read the whole of each number so trailing text is rejected.
+        char *red_end;
+        char *blue_end;
+        red = strtof(argv[1], &red_end);
+        blue = strtof(argv[2], &blue_end);
+        if (*red_end != '\0' || *blue_end != '\0' || !(red >= 0.5f && red <= 4.0f)
+                || !(blue >= 0.5f && blue <= 4.0f))
+        {
+            command_printf("Red and blue gains must each be between 0.5 and 4.0.\n");
+            return 1;
+        }
+    }
+    else if (argc == 2)
+    {
+        // Listing the presets leaves the current color setting in place.
+        if (strcmp(argv[1], "presets") == 0)
+        {
+            list_white_balance_presets();
+            return 0;
+        }
+        if (strcmp(argv[1], "auto") != 0)
+        {
+            // Find the fixed gains for the selected type of lighting.
+            for (size_t i = 0; i < preset_count; ++i)
+            {
+                if (strcmp(argv[1], white_balance_presets[i].name) == 0)
+                {
+                    red = white_balance_presets[i].red;
+                    blue = white_balance_presets[i].blue;
+                    break;
+                }
+            }
+            // Reject unknown names before passing any change to the camera.
+            if (red == 0.0f)
+            {
+                command_printf("Unknown white balance preset.\n");
+                list_white_balance_presets();
+                return 1;
+            }
+        }
+    }
+    else if (argc != 1)
+    {
+        command_printf("Usage: camera-white-balance [auto|presets|<preset>|<red-gain> <blue-gain>]\n");
+        return 1;
+    }
+    // Pass a new setting to the ISP, or read the current setting.
+    if (argc != 1)
+    {
+        const esp_err_t err = camera_set_white_balance(red, blue);
+        if (err != ESP_OK)
+        {
+            return camera_control_error(err);
+        }
+    }
+    camera_controls_t controls;
+    const esp_err_t err = camera_get_controls(&controls);
+    if (err != ESP_OK)
+    {
+        return camera_control_error(err);
+    }
+    if (controls.red_gain == 0.0f)
+    {
+        command_printf("White balance: auto\n");
+    }
+    else
+    {
+        // Report a preset by name when the active gains match it.
+        for (size_t i = 0; i < preset_count; ++i)
+        {
+            if (controls.red_gain == white_balance_presets[i].red
+                    && controls.blue_gain == white_balance_presets[i].blue)
+            {
+                command_printf("White balance: %s (red %.2f, blue %.2f)\n",
+                               white_balance_presets[i].name, controls.red_gain, controls.blue_gain);
+                return 0;
+            }
+        }
+        // Show the two gains for any other manual setting.
+        command_printf("White balance: red %.2f, blue %.2f\n", controls.red_gain, controls.blue_gain);
+    }
+    return 0;
+}
+
+/*
+ * @brief Read or set the sensor's exposure time in microseconds.
+ * @param argc Number of arguments in the command.
+ * @param argv Command name and optional auto or exposure time.
+ * @return 0 on success or 1 on error.
+*/
+static int command_camera_exposure(int argc, char **argv)
+{
+    // Read the current sensor limits before asking it for a fixed exposure.
+    camera_controls_t controls;
+    esp_err_t err = camera_get_controls(&controls);
+    if (err != ESP_OK)
+    {
+        return camera_control_error(err);
+    }
+    if (argc == 2)
+    {
+        // Zero tells the camera to use automatic exposure.
+        uint32_t requested = 0;
+        if (strcmp(argv[1], "auto") != 0)
+        {
+            // Only accept whole microseconds inside the sensor's reported range.
+            const char *value = argv[1];
+            const unsigned long number = strtoul(value, NULL, 10);
+            if (value[0] == '\0' || strspn(value, "0123456789") != strlen(value)
+                    || number == 0 || number < controls.min_exposure_us
+                    || number > controls.max_exposure_us)
+            {
+                command_printf("Exposure must be %" PRIu32 " to %" PRIu32 " us, or auto.\n",
+                               controls.min_exposure_us, controls.max_exposure_us);
+                return 1;
+            }
+            requested = (uint32_t)number;
+        }
+        err = camera_set_exposure(requested);
+        if (err != ESP_OK)
+        {
+            return camera_control_error(err);
+        }
+        // Report the accepted value even before the next frame has applied it.
+        controls.exposure_us = requested;
+    }
+    else if (argc != 1)
+    {
+        command_printf("Usage: camera-exposure [auto|<microseconds>]\n");
+        return 1;
+    }
+    // Show both the mode and the most recently applied shutter time.
+    if (controls.exposure_us == 0)
+    {
+        command_printf("Exposure: auto\n");
+    }
+    else
+    {
+        command_printf("Exposure: manual %" PRIu32 " us\n", controls.exposure_us);
+    }
+    command_printf("Applied: %" PRIu32 " us (range %" PRIu32 " to %" PRIu32 " us)\n",
+                   controls.applied_exposure_us, controls.min_exposure_us, controls.max_exposure_us);
+    return 0;
+}
+
 #if CAMERA_TRANSPORT_ZENOH
 /*
  * @brief Read or save the camera's Zenoh identity and endpoint.
@@ -485,6 +725,24 @@ static const esp_console_cmd_t commands[] =
         .hint = "[<width> <height>]",
         // Run this function to handle the user's request.
         .func = command_camera_settings,
+    },
+    {
+        .command = "camera-autofocus",
+        .help = "Turn the focus motor's automatic scan on or off",
+        .hint = "[on|off]",
+        .func = command_camera_autofocus,
+    },
+    {
+        .command = "camera-white-balance",
+        .help = "Use automatic white balance, a named preset, or manual gains",
+        .hint = "[auto|presets|<preset>|<red-gain> <blue-gain>]",
+        .func = command_camera_white_balance,
+    },
+    {
+        .command = "camera-exposure",
+        .help = "Use automatic exposure or set a shutter time in microseconds",
+        .hint = "[auto|<microseconds>]",
+        .func = command_camera_exposure,
     },
 #if CAMERA_TRANSPORT_ZENOH
     {

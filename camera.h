@@ -70,4 +70,48 @@ camera_mode_t camera_stream_get_mode(void);
 */
 esp_err_t camera_stream_set_mode(camera_mode_t mode);
 
+/* Picture controls */
+
+typedef struct
+{
+    bool focus_available;
+    bool autofocus;
+    uint32_t focus_position;
+    float red_gain;          /* Zero selects automatic white balance. */
+    float blue_gain;
+    uint32_t exposure_us;    /* Zero selects automatic exposure. */
+    uint32_t applied_exposure_us;
+    uint32_t min_exposure_us;
+    uint32_t max_exposure_us;
+} camera_controls_t;
+
+/*
+ * @brief Read the requested controls and the current exposure reported by the driver.
+ * @param controls Space for the settings and exposure range.
+ * @return ESP_OK on success or an ESP-IDF error code.
+*/
+esp_err_t camera_get_controls(camera_controls_t *controls);
+
+/*
+ * @brief Enable automatic focus or hold the lens in its current position.
+ * @param enabled True to start searching for focus.
+ * @return ESP_OK on success or an ESP-IDF error code.
+*/
+esp_err_t camera_set_autofocus(bool enabled);
+
+/*
+ * @brief Select fixed color gains or automatic white balance.
+ * @param red Red gain from 0.5 to 4.0, or zero for automatic white balance.
+ * @param blue Blue gain from 0.5 to 4.0, or zero for automatic white balance.
+ * @return ESP_OK on success or an ESP-IDF error code.
+*/
+esp_err_t camera_set_white_balance(float red, float blue);
+
+/*
+ * @brief Set the exposure time or return to automatic exposure.
+ * @param exposure_us Exposure in microseconds, or zero for automatic control.
+ * @return ESP_OK on success or an ESP-IDF error code.
+*/
+esp_err_t camera_set_exposure(uint32_t exposure_us);
+
 #endif

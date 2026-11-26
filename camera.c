@@ -21,11 +21,13 @@
 
 #include "driver/jpeg_encode.h"
 #include "esp_http_server.h"
+#include "esp_ipa.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_video_device.h"
 #include "esp_video_init.h"
 #include "esp_video_ioctl.h"
+#include "esp_video_isp_pipeline.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
@@ -46,7 +48,8 @@ enum
 
 static const char *TAG = "camera";
 static const char *STREAM_TYPE = "multipart/x-mixed-replace; boundary=frame";
-static const uint32_t VIDEO_DEVICES = ESP_VIDEO_INIT_FLAGS_MIPI_CSI | ESP_VIDEO_INIT_FLAGS_ISP;
+static const uint32_t VIDEO_DEVICES = ESP_VIDEO_INIT_FLAGS_MIPI_CSI | ESP_VIDEO_INIT_FLAGS_ISP
+        | ESP_VIDEO_INIT_FLAGS_MOTOR;
 static httpd_handle_t stream_server;
 static bool video_ready;
 static camera_output_t publisher_output;
@@ -54,6 +57,8 @@ static esp_cam_sensor_format_t *sensor_modes;
 static size_t sensor_mode_count;
 static portMUX_TYPE mode_lock = portMUX_INITIALIZER_UNLOCKED;
 static camera_mode_t requested_mode;
+static camera_controls_t requested_controls;
+static uint32_t capture_generation;
 
 typedef struct
 {
@@ -77,6 +82,252 @@ typedef struct
     SemaphoreHandle_t encoder_done;
     bool encoder_running;
 } capture_t;
+
+/* Picture controls */
+
+/*
+ * @brief Run Espressif's image processing algorithms before applying console settings.
+ * @param pipeline Active image pipeline.
+ * @param stats Measurements from the current picture.
+ * @param sensor Current sensor and lens settings.
+ * @param metadata Changes to apply to the camera hardware.
+ * @return ESP_OK on success or an ESP-IDF error code.
+*/
+esp_err_t __real_esp_ipa_pipeline_process(esp_ipa_pipeline_handle_t pipeline,
+        const esp_ipa_stats_t *stats, const esp_ipa_sensor_t *sensor, esp_ipa_metadata_t *metadata);
+
+/*
+ * @brief Apply picture controls on the ISP task with the normal sensor updates.
+ * @param pipeline Active image pipeline.
+ * @param stats Measurements from the current picture.
+ * @param sensor Current sensor and lens settings.
+ * @param metadata Changes to apply to the camera hardware.
+ * @return ESP_OK on success or the error from the image pipeline.
+*/
+esp_err_t __wrap_esp_ipa_pipeline_process(esp_ipa_pipeline_handle_t pipeline,
+        const esp_ipa_stats_t *stats, const esp_ipa_sensor_t *sensor, esp_ipa_metadata_t *metadata)
+{
+    // Let the SDK calculate the automatic settings first.
+    const esp_err_t err = __real_esp_ipa_pipeline_process(pipeline, stats, sensor, metadata);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    // Copy the console settings without holding the lock during camera work.
+    portENTER_CRITICAL(&mode_lock);
+    const camera_controls_t controls = requested_controls;
+    const uint32_t generation = capture_generation;
+    if (sensor->focus_info != NULL)
+    {
+        // Report the last lens position the SDK successfully set.
+        requested_controls.focus_position = sensor->focus_info->cur_pos;
+    }
+    portEXIT_CRITICAL(&mode_lock);
+
+    // Hold the physical lens in place when autofocus is disabled.
+    if (!controls.autofocus)
+    {
+        metadata->flags &= ~IPA_METADATA_FLAGS_FP;
+    }
+
+    // Hold gain and choose the requested exposure in the driver's normal units.
+    if (controls.exposure_us != 0)
+    {
+        metadata->flags &= ~(IPA_METADATA_FLAGS_ET | IPA_METADATA_FLAGS_GN);
+        // Allow the rounding needed to use whole rows of the sensor.
+        const uint32_t difference = sensor->cur_exposure > controls.exposure_us
+                ? sensor->cur_exposure - controls.exposure_us
+                : controls.exposure_us - sensor->cur_exposure;
+        if (difference > sensor->step_exposure + 1)
+        {
+            metadata->exposure = controls.exposure_us;
+            metadata->flags |= IPA_METADATA_FLAGS_ET;
+        }
+    }
+
+    // Remember the latest automatic gains so auto can resume immediately.
+    static float auto_red = 1.0f;
+    static float auto_blue = 1.0f;
+    if (metadata->flags & IPA_METADATA_FLAGS_RG)
+    {
+        auto_red = metadata->red_gain;
+    }
+    if (metadata->flags & IPA_METADATA_FLAGS_BG)
+    {
+        auto_blue = metadata->blue_gain;
+    }
+
+    // Apply manual gains only when they change or a capture session is reopened.
+    static float previous_red;
+    static float previous_blue;
+    static uint32_t previous_generation;
+    const bool changed = previous_red != controls.red_gain || previous_blue != controls.blue_gain;
+    if (controls.red_gain != 0.0f)
+    {
+        // Keep this session's fixed gains when AWB suggests a different value.
+        metadata->flags &= ~(IPA_METADATA_FLAGS_RG | IPA_METADATA_FLAGS_BG);
+        if (changed || generation != previous_generation)
+        {
+            metadata->red_gain = controls.red_gain;
+            metadata->blue_gain = controls.blue_gain;
+            metadata->flags |= IPA_METADATA_FLAGS_RG | IPA_METADATA_FLAGS_BG;
+        }
+    }
+    else if (changed)
+    {
+        // Restore the current auto gains without waiting for a lighting change.
+        metadata->red_gain = auto_red;
+        metadata->blue_gain = auto_blue;
+        metadata->flags |= IPA_METADATA_FLAGS_RG | IPA_METADATA_FLAGS_BG;
+    }
+    // Remember the settings the ISP saw on this frame.
+    previous_red = controls.red_gain;
+    previous_blue = controls.blue_gain;
+    previous_generation = generation;
+    return ESP_OK;
+}
+
+/*
+ * @brief Place three focus measurement windows across the centre of the picture.
+ * @param mode Dimensions of the active capture format.
+ * @return ESP_OK when the focus scan was reset or an ESP-IDF error code.
+*/
+static esp_err_t set_focus_windows(camera_mode_t mode)
+{
+    // Keep the windows inside the picture even after a resolution change.
+    isp_window_t windows[ISP_AF_WINDOW_NUM] = {0};
+    for (unsigned i = 0; i < ISP_AF_WINDOW_NUM; ++i)
+    {
+        // Match the IMX708 tuning's centre band and scale it to the active size.
+        windows[i].top_left.x = mode.width * (1 + 2 * i) / 8;
+        windows[i].top_left.y = mode.height * 340u / 1080;
+        windows[i].btm_right.x = mode.width * (3 + 2 * i) / 8 - 1;
+        windows[i].btm_right.y = mode.height * 740u / 1080 - 1;
+    }
+    // Updating the windows also starts a fresh focus scan.
+    return esp_video_isp_pipeline_set_af_windows(windows);
+}
+
+/*
+ * @brief Read the requested controls and the current exposure reported by the driver.
+ * @param controls Space for the settings and exposure range.
+ * @return ESP_OK on success or an ESP-IDF error code.
+*/
+esp_err_t camera_get_controls(camera_controls_t *controls)
+{
+    // Check that there is room for the current settings and a camera to read.
+    if (controls == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!video_ready)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    // Copy the settings while the ISP task may also be using them.
+    portENTER_CRITICAL(&mode_lock);
+    *controls = requested_controls;
+    portEXIT_CRITICAL(&mode_lock);
+    // Read the exposure that the SDK last applied and the sensor's limits.
+    esp_video_isp_pipeline_sensor_ae_t ae;
+    const esp_err_t err = esp_video_isp_pipeline_get_sensor_ae(&ae);
+    if (err == ESP_OK)
+    {
+        controls->applied_exposure_us = ae.exposure_us;
+        controls->min_exposure_us = ae.min_exposure_us;
+        controls->max_exposure_us = ae.max_exposure_us;
+    }
+    return err;
+}
+
+/*
+ * @brief Enable automatic focus or hold the lens in its current position.
+ * @param enabled True to start searching for focus.
+ * @return ESP_OK on success or an ESP-IDF error code.
+*/
+esp_err_t camera_set_autofocus(bool enabled)
+{
+    // Require a working camera and its actual focus motor.
+    camera_controls_t controls;
+    esp_err_t err = camera_get_controls(&controls);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+    if (!controls.focus_available)
+    {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    // Reset the scan when turning focus on so it starts with the current picture.
+    if (enabled)
+    {
+        err = set_focus_windows(camera_stream_get_mode());
+        if (err != ESP_OK)
+        {
+            return err;
+        }
+    }
+    // Let the ISP task know whether it should move the lens.
+    portENTER_CRITICAL(&mode_lock);
+    requested_controls.autofocus = enabled;
+    portEXIT_CRITICAL(&mode_lock);
+    return ESP_OK;
+}
+
+/*
+ * @brief Select fixed color gains or automatic white balance.
+ * @param red Red gain from 0.5 to 4.0, or zero for automatic white balance.
+ * @param blue Blue gain from 0.5 to 4.0, or zero for automatic white balance.
+ * @return ESP_OK on success or an ESP-IDF error code.
+*/
+esp_err_t camera_set_white_balance(float red, float blue)
+{
+    // A pair of zeros selects auto. All manual values must fit the gain range.
+    if (!(red == 0.0f && blue == 0.0f)
+            && !(red >= 0.5f && red <= 4.0f && blue >= 0.5f && blue <= 4.0f))
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    camera_controls_t controls;
+    const esp_err_t err = camera_get_controls(&controls);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+    // Give both values to the ISP together so it cannot see half an update.
+    portENTER_CRITICAL(&mode_lock);
+    requested_controls.red_gain = red;
+    requested_controls.blue_gain = blue;
+    portEXIT_CRITICAL(&mode_lock);
+    return ESP_OK;
+}
+
+/*
+ * @brief Set the exposure time or return to automatic exposure.
+ * @param exposure_us Exposure in microseconds, or zero for automatic control.
+ * @return ESP_OK on success or an ESP-IDF error code.
+*/
+esp_err_t camera_set_exposure(uint32_t exposure_us)
+{
+    // Check the current sensor range before accepting a fixed exposure.
+    camera_controls_t controls;
+    const esp_err_t err = camera_get_controls(&controls);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+    if (exposure_us != 0 && (exposure_us < controls.min_exposure_us
+            || exposure_us > controls.max_exposure_us))
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    // Apply this request on the ISP task before the next sensor update.
+    portENTER_CRITICAL(&mode_lock);
+    requested_controls.exposure_us = exposure_us;
+    portEXIT_CRITICAL(&mode_lock);
+    return ESP_OK;
+}
 
 /* Camera and encoder setup */
 
@@ -121,6 +372,10 @@ static esp_err_t load_sensor_modes(camera_mode_t *mode)
         // Stop if there is no driver to ask.
         return ESP_ERR_NOT_FOUND;
     }
+
+    // Check for a real focus motor rather than assuming every sensor has one.
+    struct v4l2_query_ext_ctrl focus = { .id = V4L2_CID_FOCUS_ABSOLUTE };
+    requested_controls.focus_available = ioctl(fd, VIDIOC_QUERY_EXT_CTRL, &focus) == 0;
 
     // Start with the driver's first format.
     struct v4l2_sensor_format_enum entry = {0};
@@ -189,6 +444,46 @@ static esp_err_t load_sensor_modes(camera_mode_t *mode)
 }
 
 /*
+ * @brief Restore the manual exposure after the sensor reloads its format.
+ * @param fd Open camera device.
+ * @param format Format containing the duration of one row of exposure.
+ * @param exposure_us Time requested in microseconds.
+ * @return ESP_OK on success or an ESP-IDF error code.
+*/
+static esp_err_t restore_exposure(int fd, const esp_cam_sensor_format_t *format, uint32_t exposure_us)
+{
+    // Read the sensor timing and check which exposure values the driver accepts.
+    struct v4l2_query_ext_ctrl range = { .id = V4L2_CID_EXPOSURE };
+    if (format->isp_info == NULL || format->isp_info->isp_v1_info.tline_ns == 0
+            || ioctl(fd, VIDIOC_QUERY_EXT_CTRL, &range) != 0 || range.step == 0)
+    {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    // Round the shutter time to the same row increments used by the ISP.
+    const uint32_t row_ns = format->isp_info->isp_v1_info.tline_ns;
+    uint64_t rows = ((uint64_t)exposure_us * 1000 + row_ns / 2) / row_ns;
+    rows = rows / range.step * range.step;
+    // Keep the request inside the limits of the newly selected format.
+    if (rows < (uint64_t)range.minimum)
+    {
+        rows = (uint64_t)range.minimum;
+    }
+    if (rows > (uint64_t)range.maximum)
+    {
+        rows = (uint64_t)range.maximum;
+    }
+    // Set the shutter before the new capture begins delivering frames.
+    struct v4l2_ext_control exposure = { .id = V4L2_CID_EXPOSURE, .value = (int32_t)rows };
+    struct v4l2_ext_controls request =
+    {
+        .ctrl_class = V4L2_CID_CAMERA_CLASS,
+        .count = 1,
+        .controls = &exposure,
+    };
+    return ioctl(fd, VIDIOC_S_EXT_CTRLS, &request) == 0 ? ESP_OK : ESP_FAIL;
+}
+
+/*
  * @brief Program the sensor size before allocating buffers.
  * @param fd Open camera device.
  * @param mode Requested picture size.
@@ -213,6 +508,23 @@ static esp_err_t configure_capture_mode(int fd, camera_mode_t mode)
     {
         // Report that the sensor could not be set up.
         return ESP_FAIL;
+    }
+
+    // A different sensor format writes its own exposure defaults.
+    if (current.regs != sensor->regs)
+    {
+        portENTER_CRITICAL(&mode_lock);
+        const uint32_t exposure_us = requested_controls.exposure_us;
+        portEXIT_CRITICAL(&mode_lock);
+        if (exposure_us != 0)
+        {
+            // Reapply the shutter even if the ISP still remembers the old value.
+            const esp_err_t err = restore_exposure(fd, sensor, exposure_us);
+            if (err != ESP_OK)
+            {
+                ESP_LOGW(TAG, "Could not restore exposure after mode change (%s)", esp_err_to_name(err));
+            }
+        }
     }
 
     // Tell the caller the sensor size is ready.
@@ -433,6 +745,21 @@ static esp_err_t open_capture(capture_t *capture, camera_mode_t mode)
     {
         // Stop if the camera cannot set a limit on the wait.
         return ESP_FAIL;
+    }
+
+    // Tell the ISP task to reapply manual gains for the new capture session.
+    portENTER_CRITICAL(&mode_lock);
+    ++capture_generation;
+    const bool focus_available = requested_controls.focus_available;
+    portEXIT_CRITICAL(&mode_lock);
+    if (focus_available)
+    {
+        // Refit the focus measurement windows when the picture size changes.
+        const esp_err_t focus_err = set_focus_windows(mode);
+        if (focus_err != ESP_OK)
+        {
+            ESP_LOGW(TAG, "Focus window setup failed (%s)", esp_err_to_name(focus_err));
+        }
     }
 
     // Tell the driver to start filling the frame buffers.
@@ -941,7 +1268,20 @@ static esp_err_t init_camera(const camera_config_t *config)
         .pwdn_pin = config->power_down_gpio,
     };
     // Use the board's camera connection for this video device.
-    const esp_video_init_config_t video = { .csi = &csi };
+    const esp_video_init_config_t video =
+    {
+        .csi = &csi,
+#if CONFIG_ESP_VIDEO_ENABLE_CAMERA_MOTOR_CONTROLLER
+        // The IMX708 lens motor shares the camera's control wires.
+        .cam_motor = &(const esp_video_init_cam_motor_config_t)
+        {
+            .sccb_config = csi.sccb_config,
+            .reset_pin = -1,
+            .pwdn_pin = -1,
+            .signal_pin = -1,
+        },
+#endif
+    };
     // Let the camera driver find the sensor and set up the color processing hardware.
     esp_err_t err = esp_video_init_with_flags(&video, VIDEO_DEVICES);
     // Check whether the video hardware started before opening a server.
