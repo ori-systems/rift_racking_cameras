@@ -1,6 +1,6 @@
 /*
  * @file camera.c
- * @brief Stream live JPEG frames over HTTP.
+ * @brief Capture live JPEG frames and send them through the selected transport.
  * @author Ajay Varghese
  * @date 2026-11-25
 */
@@ -40,12 +40,16 @@ enum
     JPEG_BUFFER_COUNT = 2,
     JPEG_QUALITY = 70,
     TIMING_FRAME_COUNT = 30,
+    MAX_FRAME_LONG_SIDE = 1920,
+    MAX_FRAME_SHORT_SIDE = 1080,
 };
 
 static const char *TAG = "camera";
 static const char *STREAM_TYPE = "multipart/x-mixed-replace; boundary=frame";
 static const uint32_t VIDEO_DEVICES = ESP_VIDEO_INIT_FLAGS_MIPI_CSI | ESP_VIDEO_INIT_FLAGS_ISP;
 static httpd_handle_t stream_server;
+static bool video_ready;
+static camera_output_t publisher_output;
 static esp_cam_sensor_format_t *sensor_modes;
 static size_t sensor_mode_count;
 static portMUX_TYPE mode_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -56,6 +60,7 @@ typedef struct
     uint8_t *data;
     size_t capacity;
     uint32_t size;
+    uint64_t timestamp_ns;
 } jpeg_frame_t;
 
 typedef struct
@@ -124,12 +129,21 @@ static esp_err_t load_sensor_modes(camera_mode_t *mode)
     // Read formats until the driver runs out.
     for (; ioctl(fd, VIDIOC_ENUM_SENSOR_FMT, &entry) == 0; ++entry.index)
     {
+        // Read the size once for the 1080p and JPEG checks.
+        const uint16_t width = entry.format.width;
+        const uint16_t height = entry.format.height;
+        // Allow up to 1080p in either landscape or portrait.
+        if ((width > MAX_FRAME_LONG_SIDE || height > MAX_FRAME_SHORT_SIDE)
+                && (width > MAX_FRAME_SHORT_SIDE || height > MAX_FRAME_LONG_SIDE))
+        {
+            // Skip larger pictures.
+            continue;
+        }
         // Keep only sizes and pixel data the current JPEG setup can use.
         if ((entry.format.format != ESP_CAM_SENSOR_PIXFORMAT_RAW8
              && entry.format.format != ESP_CAM_SENSOR_PIXFORMAT_RAW10)
                 || entry.format.fps == 0
-                || entry.format.width % 16 != 0 || entry.format.height % 8 != 0
-                || entry.format.width == 0 || entry.format.height == 0)
+                || width % 16 != 0 || height % 8 != 0 || width == 0 || height == 0)
         {
             // Move on to the next format.
             continue;
@@ -488,6 +502,18 @@ static esp_err_t encode_frame(const capture_t *capture, jpeg_frame_t *output,
         return err;
     }
 
+    // Read the board's UTC clock as close as possible to when the frame arrived.
+    struct timeval capture_time;
+    // Use zero until NTP has set a plausible Unix time.
+    output->timestamp_ns = 0;
+    // A clock from before 2021 indicates that it has not been set.
+    if (gettimeofday(&capture_time, NULL) == 0 && capture_time.tv_sec >= 1609459200)
+    {
+        // Convert seconds and microseconds to nanoseconds for the ROS 2 header.
+        output->timestamp_ns = (uint64_t)capture_time.tv_sec * 1000000000ULL
+                               + (uint64_t)capture_time.tv_usec * 1000;
+    }
+
     // Mark the end of the wait and the start of the encoding work.
     const int64_t jpeg_start = capture_wait_us != NULL ? esp_timer_get_time() : 0;
     // Check that the camera wrote enough data for the whole picture.
@@ -647,13 +673,18 @@ static esp_err_t start_jpeg_worker(capture_t *capture)
 
 /*
  * @brief Write the header and payload of a JPEG frame.
- * @param request HTTP connection to the viewer.
+ * @param context HTTP connection to the viewer.
  * @param data Bytes of the picture.
  * @param length Number of bytes in the picture.
+ * @param timestamp_ns Capture time, unused by the HTTP preview.
  * @return ESP_OK if both parts were sent.
 */
-static esp_err_t send_frame(httpd_req_t *request, const uint8_t *data, uint32_t length)
+static esp_err_t send_frame(void *context, const uint8_t *data, uint32_t length, uint64_t timestamp_ns)
 {
+    // Use the HTTP connection passed in by the stream handler.
+    httpd_req_t *request = context;
+    // The multipart JPEG format carries only the picture.
+    (void)timestamp_ns;
     // Make room for the boundary and frame length.
     char header[96];
     // Tell the viewer how many bytes to read for this JPEG.
@@ -679,12 +710,12 @@ static esp_err_t send_frame(httpd_req_t *request, const uint8_t *data, uint32_t 
 
 /*
  * @brief Send frames until the viewer leaves or UART requests a different size.
- * @param request HTTP connection to the viewer.
+ * @param output Transport callbacks for this stream.
  * @param capture Camera and JPEG worker for the active size.
  * @param mode Current picture size.
  * @return ESP_OK when capture should restart at a new size, or a stream error.
 */
-static esp_err_t stream_frames(httpd_req_t *request, const capture_t *capture, camera_mode_t mode)
+static esp_err_t stream_frames(const camera_output_t *output, const capture_t *capture, camera_mode_t mode)
 {
     // Time the sender separately because its work overlaps the JPEG worker.
     int64_t send_us = 0;
@@ -693,6 +724,11 @@ static esp_err_t stream_frames(httpd_req_t *request, const capture_t *capture, c
 
     for (;;)
     {
+        // Stop capture when the transport has nobody to receive pictures.
+        if (output->ready != NULL && !output->ready(output->context))
+        {
+            return ESP_ERR_INVALID_STATE;
+        }
         // Check for a size change between complete pictures.
         const camera_mode_t next = camera_stream_get_mode();
         // Give the caller a chance to stop the old camera before it opens the new size.
@@ -709,13 +745,13 @@ static esp_err_t stream_frames(httpd_req_t *request, const capture_t *capture, c
         {
             return ESP_FAIL;
         }
-        // Mark the start of the TCP write while there are still samples to take.
+        // Mark the start of the write while there are still samples to take.
         const bool measure = sample_count < TIMING_FRAME_COUNT;
         // Start timing after receiving a finished JPEG to exclude time spent waiting.
         const int64_t send_start = measure ? esp_timer_get_time() : 0;
         // Send this JPEG while the worker can write to the other slot.
-        const esp_err_t err = send_frame(request, slot->data, slot->size);
-        // Add the time spent on this TCP write.
+        const esp_err_t err = output->send(output->context, slot->data, slot->size, slot->timestamp_ns);
+        // Add the time spent on this write.
         if (measure)
         {
             send_us += esp_timer_get_time() - send_start;
@@ -730,7 +766,7 @@ static esp_err_t stream_frames(httpd_req_t *request, const capture_t *capture, c
         // Print the average TCP time after gathering the full sample.
         if (measure && ++sample_count == TIMING_FRAME_COUNT)
         {
-            ESP_LOGI(TAG, "Average over %u frames: TCP send %" PRIi64 " us",
+            ESP_LOGI(TAG, "Average over %u frames: transport send %" PRIi64 " us",
                      sample_count, send_us / TIMING_FRAME_COUNT);
         }
     }
@@ -743,6 +779,8 @@ static esp_err_t stream_frames(httpd_req_t *request, const capture_t *capture, c
 */
 static esp_err_t stream_handler(httpd_req_t *request)
 {
+    // Use the shared JPEG sender with an HTTP connection as its output.
+    const camera_output_t output = { .send = send_frame, .context = request };
     // Tell the viewer to expect a series of separately framed pictures.
     esp_err_t err = httpd_resp_set_type(request, STREAM_TYPE);
     // Remember whether capture was able to start on this connection.
@@ -765,7 +803,7 @@ static esp_err_t stream_handler(httpd_req_t *request)
         if (err == ESP_OK)
         {
             started = true;
-            err = stream_frames(request, &capture, mode);
+            err = stream_frames(&output, &capture, mode);
         }
         else
         {
@@ -810,10 +848,10 @@ camera_mode_t camera_stream_get_mode(void)
 */
 esp_err_t camera_stream_set_mode(camera_mode_t mode)
 {
-    // Make sure the camera server has finished starting.
-    if (stream_server == NULL)
+    // Make sure the camera has finished starting.
+    if (!video_ready)
     {
-        // The driver cannot use new settings before startup.
+        // There are no camera settings to change before startup.
         return ESP_ERR_INVALID_STATE;
     }
     // Check that the sensor can give us this size.
@@ -849,26 +887,28 @@ static void release_video(void)
     sensor_modes = NULL;
     // Forget how many modes were in the list.
     sensor_mode_count = 0;
+    // Allow startup to try again after giving back the hardware.
+    video_ready = false;
     // Give back the hardware when there is no server to use it.
     esp_video_deinit_with_flags(VIDEO_DEVICES);
 }
 
 /*
- * @brief Set up the camera and start its JPEG stream server.
- * @param config Camera wiring and HTTP port.
+ * @brief Detect the camera and load its supported modes.
+ * @param config Camera wiring and initial resolution.
  * @return ESP_OK on success or an ESP-IDF error code.
 */
-esp_err_t camera_stream_start(const camera_config_t *config)
+static esp_err_t init_camera(const camera_config_t *config)
 {
-    // Check that the caller supplied the camera pins and a port to listen on.
-    if (config == NULL || config->port == 0)
+    // Check that the caller supplied the camera wiring.
+    if (config == NULL)
     {
         // Stop before trying to use missing settings.
         return ESP_ERR_INVALID_ARG;
     }
 
-    // Check that there is only one camera stream server.
-    if (stream_server != NULL)
+    // Check that there is only one owner of the camera.
+    if (video_ready)
     {
         // Keep the running server if setup is called again.
         return ESP_ERR_INVALID_STATE;
@@ -929,7 +969,31 @@ esp_err_t camera_stream_start(const camera_config_t *config)
     requested_mode = mode;
     // Let other tasks read the ready settings.
     portEXIT_CRITICAL(&mode_lock);
+    // Show that the camera is ready for a transport to use.
+    video_ready = true;
+    // Tell the caller the sensor was set up.
+    return ESP_OK;
+}
 
+/*
+ * @brief Set up the camera and start its JPEG stream server.
+ * @param config Camera wiring and HTTP port.
+ * @return ESP_OK on success or an ESP-IDF error code.
+*/
+esp_err_t camera_stream_start(const camera_config_t *config)
+{
+    // Make sure there is an HTTP port to listen on.
+    if (config == NULL || config->port == 0)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    // Set up the same camera and encoder used by other transports.
+    esp_err_t err = init_camera(config);
+    // Stop if the camera is not ready.
+    if (err != ESP_OK)
+    {
+        return err;
+    }
     // Start from the SDK's usual HTTP server settings.
     httpd_config_t server = HTTPD_DEFAULT_CONFIG();
     // Listen on the port the viewer will connect to.
@@ -974,5 +1038,86 @@ esp_err_t camera_stream_start(const camera_config_t *config)
     // Print the path to use once Ethernet has an address.
     ESP_LOGI(TAG, "MJPEG ready on port %u at /stream", config->port);
     // Tell the caller that the server is ready.
+    return ESP_OK;
+}
+
+/*
+ * @brief Wait for the transport, then run the shared JPEG sender in the background.
+ * @param arg Output callbacks and their context.
+*/
+static void publisher_task(void *arg)
+{
+    // Use the transport selected by the application.
+    const camera_output_t *output = arg;
+    for (;;)
+    {
+        // Leave the camera idle until someone is ready to receive frames.
+        if (output->ready == NULL || output->ready(output->context))
+        {
+            // Read the current resolution before opening the sensor.
+            const camera_mode_t mode = camera_stream_get_mode();
+            // Use an empty state so cleanup works even if setup fails.
+            capture_t capture = { .fd = -1 };
+            // Prepare the capture buffers for the current resolution.
+            esp_err_t err = open_capture(&capture, mode);
+            // Start the parallel encoder only when capture is ready.
+            if (err == ESP_OK)
+            {
+                err = start_jpeg_worker(&capture);
+            }
+            // Send pictures until the transport or resolution changes.
+            if (err == ESP_OK)
+            {
+                err = stream_frames(output, &capture, mode);
+            }
+            // Wait for the encoder to finish before giving its memory back.
+            close_capture(&capture);
+            // Keep normal disconnects quiet and log other stream errors.
+            if (err != ESP_OK && err != ESP_ERR_INVALID_STATE)
+            {
+                ESP_LOGW(TAG, "Camera publisher paused (%s)", esp_err_to_name(err));
+            }
+            // Reopen straight away if UART changed only the resolution.
+            if (err == ESP_OK)
+            {
+                continue;
+            }
+        }
+        // Leave time for other work while the transport or camera recovers.
+        vTaskDelay(pdMS_TO_TICKS(250));
+    }
+}
+
+/*
+ * @brief Start a background JPEG stream using the supplied transport callbacks.
+ * @param config Camera wiring and default resolution.
+ * @param output Callbacks and context used by the sender.
+ * @return ESP_OK on success or an ESP-IDF error code.
+*/
+esp_err_t camera_publish_start(const camera_config_t *config, const camera_output_t *output)
+{
+    // Make sure the sender has somewhere to deliver the JPEGs.
+    if (output == NULL || output->send == NULL)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    // Detect the camera and prepare the list of resolutions.
+    esp_err_t err = init_camera(config);
+    // Stop if the camera could not start.
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+    // Keep a copy so the sender task can use it after startup returns.
+    publisher_output = *output;
+    // Run the sender alongside the encoder and the UART console.
+    if (xTaskCreate(publisher_task, "camera_send", 6144, &publisher_output,
+                    tskIDLE_PRIORITY + 5, NULL) != pdPASS)
+    {
+        // Give back the camera if its sender could not be started.
+        release_video();
+        return ESP_ERR_NO_MEM;
+    }
+    // The sender will begin capturing when its transport is ready.
     return ESP_OK;
 }
