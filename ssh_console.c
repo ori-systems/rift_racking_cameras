@@ -31,6 +31,8 @@ enum
 {
     HOST_KEY_CAPACITY = 192,
     COMMAND_CAPACITY = 256,
+    HISTORY_CAPACITY = 12,
+    DEFAULT_TERMINAL_COLUMNS = 80,
     REPLY_CAPACITY = 1536,
     LOGIN_TIMEOUT_SECONDS = 15,
     IDLE_TIMEOUT_SECONDS = 120,
@@ -42,6 +44,29 @@ typedef struct
     size_t used;
     bool terminal;
 } ssh_reply_t;
+
+typedef struct
+{
+    char commands[HISTORY_CAPACITY][COMMAND_CAPACITY];
+    char draft[COMMAND_CAPACITY];
+    size_t next;
+    size_t count;
+    size_t offset;  /* Zero is the unfinished line, one is the latest command. */
+} ssh_history_t;
+
+typedef enum
+{
+    SSH_ESCAPE_NONE,
+    SSH_ESCAPE_START,
+    SSH_ESCAPE_CONTROL,
+} ssh_escape_t;
+
+enum
+{
+    SSH_KEY_IGNORE = -1,
+    SSH_KEY_UP = 256,
+    SSH_KEY_DOWN,
+};
 
 static const char *TAG = "ssh_console";
 static ssh_console_config_t console_config;
@@ -285,12 +310,165 @@ static bool run_command(WOLFSSH *ssh, const char *line, bool terminal, bool *res
 }
 
 /*
+ * @brief Read an arrow key even when its bytes arrive in separate packets.
+ * @param escape Part of an escape sequence that has already arrived.
+ * @param key Next byte from the terminal.
+ * @return A character, a history key, or SSH_KEY_IGNORE.
+*/
+static int read_terminal_key(ssh_escape_t *escape, byte key)
+{
+    // An escape byte starts a new sequence, even after an unfinished one.
+    if (key == '\033')
+    {
+        *escape = SSH_ESCAPE_START;
+        return SSH_KEY_IGNORE;
+    }
+    if (*escape == SSH_ESCAPE_START)
+    {
+        // Terminals can use either of these prefixes for the arrow keys.
+        if (key == '[' || key == 'O')
+        {
+            *escape = SSH_ESCAPE_CONTROL;
+            return SSH_KEY_IGNORE;
+        }
+        *escape = SSH_ESCAPE_NONE;
+    }
+    else if (*escape == SSH_ESCAPE_CONTROL)
+    {
+        // Skip optional parameters, such as the ones sent with a modifier key.
+        if (key >= 0x20 && key <= 0x3f)
+        {
+            return SSH_KEY_IGNORE;
+        }
+        *escape = SSH_ESCAPE_NONE;
+        // Consume other escape keys so their letters do not enter the command.
+        if (key >= 0x40 && key <= 0x7e)
+        {
+            if (key == 'A')
+            {
+                return SSH_KEY_UP;
+            }
+            if (key == 'B')
+            {
+                return SSH_KEY_DOWN;
+            }
+            return SSH_KEY_IGNORE;
+        }
+    }
+    // Let the existing editor handle normal characters and control keys.
+    return key;
+}
+
+/*
+ * @brief Store one submitted command in the session's history.
+ * @param history Recent commands from this SSH connection.
+ * @param line Finished line to remember.
+ * @param length Number of characters in the line.
+*/
+static void remember_command(ssh_history_t *history, const char *line, size_t length)
+{
+    // Ignore blank lines and repeated copies of the most recent command.
+    const size_t latest = (history->next + HISTORY_CAPACITY - 1) % HISTORY_CAPACITY;
+    if (strspn(line, " ") == length
+            || (history->count != 0 && strcmp(history->commands[latest], line) == 0))
+    {
+        return;
+    }
+    // Reuse the oldest slot once all slots have been filled.
+    memcpy(history->commands[history->next], line, length + 1);
+    history->next = (history->next + 1) % HISTORY_CAPACITY;
+    if (history->count < HISTORY_CAPACITY)
+    {
+        ++history->count;
+    }
+}
+
+/*
+ * @brief Clear the displayed input and redraw it from the prompt.
+ * @param ssh Client connection.
+ * @param old_length Number of input characters previously shown.
+ * @param line Input to display.
+ * @param length Number of characters to display.
+ * @param columns Width reported by the terminal.
+ * @return true if the connection can still receive output.
+*/
+static bool redraw_terminal_line(WOLFSSH *ssh, size_t old_length, const char *line,
+                                 size_t length, size_t columns)
+{
+    // Return to the first row before clearing a line that wrapped.
+    const size_t prompt_length = strlen(console_config.prompt);
+    const size_t printed = prompt_length + old_length;
+    const size_t wrapped_rows = printed == 0 ? 0 : (printed - 1) / columns;
+    if (wrapped_rows != 0)
+    {
+        char clear[32];
+        const int size = snprintf(clear, sizeof(clear), "\r\033[%zuA\033[J", wrapped_rows);
+        if (!send_bytes(ssh, clear, (size_t)size))
+        {
+            return false;
+        }
+    }
+    else if (!send_bytes(ssh, "\r\033[K", 4))
+    {
+        return false;
+    }
+    // Keep the cursor just after the input so editing can continue.
+    return send_bytes(ssh, console_config.prompt, prompt_length) && send_bytes(ssh, line, length);
+}
+
+/*
+ * @brief Replace the current input with a remembered command or the draft.
+ * @param ssh Client connection.
+ * @param history Recent commands and the saved unfinished line.
+ * @param key Up or Down history key.
+ * @param line Input buffer to replace.
+ * @param length Current line length, updated after a recall.
+ * @param columns Width reported by the terminal.
+ * @return true if the connection can still receive output.
+*/
+static bool recall_command(WOLFSSH *ssh, ssh_history_t *history, int key,
+                           char *line, size_t *length, size_t columns)
+{
+    // Stop at the oldest entry or at the unfinished line.
+    if ((key == SSH_KEY_UP && history->offset == history->count)
+            || (key == SSH_KEY_DOWN && history->offset == 0))
+    {
+        return true;
+    }
+    if (history->offset == 0)
+    {
+        // Keep what was typed before the user entered the history list.
+        memcpy(history->draft, line, *length);
+        history->draft[*length] = '\0';
+    }
+    // Move one place in the list and find the corresponding slot.
+    history->offset = key == SSH_KEY_UP ? history->offset + 1 : history->offset - 1;
+    const size_t index = (history->next + HISTORY_CAPACITY - history->offset) % HISTORY_CAPACITY;
+    const char *replacement = history->offset == 0 ? history->draft : history->commands[index];
+
+    // Show the recalled input before replacing the editor's copy.
+    const size_t replacement_length = strlen(replacement);
+    if (!redraw_terminal_line(ssh, *length, replacement, replacement_length, columns))
+    {
+        return false;
+    }
+    // Make the displayed command available for editing or Enter.
+    *length = replacement_length;
+    memcpy(line, replacement, replacement_length + 1);
+    return true;
+}
+
+/*
  * @brief Read lines from an interactive SSH session and run each command.
  * @param ssh Client connection.
+ * @param columns Width reported by the terminal.
  * @return true if a command requested a restart.
 */
-static bool run_terminal(WOLFSSH *ssh)
+static bool run_terminal(WOLFSSH *ssh, size_t columns)
 {
+    // Keep history and unfinished escape keys for this connection only.
+    ssh_history_t history = {0};
+    ssh_escape_t escape = SSH_ESCAPE_NONE;
     // Keep room for one line of input and its ending zero byte.
     char line[COMMAND_CAPACITY];
     size_t length = 0;
@@ -312,7 +490,11 @@ static bool run_terminal(WOLFSSH *ssh)
         // Handle control keys and printable characters in the order they arrived.
         for (int i = 0; i < received; ++i)
         {
-            const byte key = input[i];
+            const int key = read_terminal_key(&escape, input[i]);
+            if (key == SSH_KEY_IGNORE)
+            {
+                continue;
+            }
             // Treat CR and LF as a single Enter key when both arrive.
             if (key == '\n' && after_cr)
             {
@@ -320,6 +502,15 @@ static bool run_terminal(WOLFSSH *ssh)
                 continue;
             }
             after_cr = key == '\r';
+            if (key == SSH_KEY_UP || key == SSH_KEY_DOWN)
+            {
+                // Do not turn an overlong input into a partial command.
+                if (!too_long && !recall_command(ssh, &history, key, line, &length, columns))
+                {
+                    return false;
+                }
+                continue;
+            }
             // Finish the current line when Enter is pressed.
             if (key == '\r' || key == '\n')
             {
@@ -344,6 +535,8 @@ static bool run_terminal(WOLFSSH *ssh)
                     {
                         return false;
                     }
+                    // Keep the command before running it so Up can find it later.
+                    remember_command(&history, line, length);
                     // Finish sending the reply before applying a restart.
                     bool restart = false;
                     int status = 0;
@@ -355,6 +548,7 @@ static bool run_terminal(WOLFSSH *ssh)
                 // Clear the line and get ready for the next command.
                 length = 0;
                 too_long = false;
+                history.offset = 0;
                 if (!send_bytes(ssh, console_config.prompt, prompt_size))
                 {
                     return false;
@@ -369,7 +563,12 @@ static bool run_terminal(WOLFSSH *ssh)
             {
                 // Remove the last character from the line and the screen.
                 --length;
-                if (!send_bytes(ssh, "\b \b", 3))
+                // Redraw at a wrap boundary so the cursor stays on the right row.
+                const size_t column = (prompt_size + length) % columns;
+                const bool near_wrap = column == 0 || column == columns - 1;
+                const bool drawn = near_wrap ? redraw_terminal_line(ssh, length + 1, line, length, columns)
+                                             : send_bytes(ssh, "\b \b", 3);
+                if (!drawn)
                 {
                     return false;
                 }
@@ -398,6 +597,29 @@ static bool run_terminal(WOLFSSH *ssh)
 /* Listener and public API */
 
 /*
+ * @brief Remember the terminal width for drawing recalled lines.
+ * @param ssh Connection reporting its terminal size.
+ * @param columns Number of character columns.
+ * @param rows Number of character rows, unused.
+ * @param width_pixels Terminal width in pixels, unused.
+ * @param height_pixels Terminal height in pixels, unused.
+ * @param context Storage for the terminal width.
+ * @return WS_SUCCESS to accept the size.
+*/
+static int remember_terminal_width(WOLFSSH *ssh, word32 columns, word32 rows,
+                                   word32 width_pixels, word32 height_pixels, void *context)
+{
+    // Input wraps by text columns, so the other dimensions are not needed.
+    (void)ssh;
+    (void)rows;
+    (void)width_pixels;
+    (void)height_pixels;
+    size_t *width = context;
+    *width = columns == 0 ? DEFAULT_TERMINAL_COLUMNS : columns;
+    return WS_SUCCESS;
+}
+
+/*
  * @brief Serve one SSH client and close its session before returning.
  * @param fd Accepted Ethernet socket.
  * @return true if the client ran a command that requires a restart.
@@ -417,6 +639,10 @@ static bool serve_client(int fd)
     // Connect wolfSSH to the accepted socket and limit login retries.
     wolfSSH_set_fd(ssh, fd);
     wolfSSH_SetMaxAuthAttempts(ssh, 3);
+    // Capture the terminal width from the client's request before showing the prompt.
+    size_t columns = DEFAULT_TERMINAL_COLUMNS;
+    wolfSSH_SetTerminalResizeCtx(ssh, &columns);
+    wolfSSH_SetTerminalResizeCb(ssh, remember_terminal_width);
     bool restart = false;
     if (wolfSSH_accept(ssh) == WS_SUCCESS)
     {
@@ -448,7 +674,7 @@ static bool serve_client(int fd)
         else if (type == WOLFSSH_SESSION_SHELL || type == WOLFSSH_SESSION_TERMINAL)
         {
             // Enter the same prompt that someone sees on UART.
-            restart = run_terminal(ssh);
+            restart = run_terminal(ssh, columns);
         }
         else
         {
