@@ -49,10 +49,24 @@ typedef struct
 {
     char commands[HISTORY_CAPACITY][COMMAND_CAPACITY];
     char draft[COMMAND_CAPACITY];
+    size_t draft_cursor;
     size_t next;
     size_t count;
     size_t offset;  /* Zero is the unfinished line, one is the latest command. */
 } ssh_history_t;
+
+typedef struct
+{
+    char text[COMMAND_CAPACITY];
+    size_t length;
+    size_t cursor;
+} ssh_line_t;
+
+typedef struct
+{
+    size_t row;
+    size_t column;
+} ssh_cursor_t;
 
 typedef enum
 {
@@ -66,6 +80,8 @@ enum
     SSH_KEY_IGNORE = -1,
     SSH_KEY_UP = 256,
     SSH_KEY_DOWN,
+    SSH_KEY_LEFT,
+    SSH_KEY_RIGHT,
 };
 
 static const char *TAG = "ssh_console";
@@ -313,7 +329,7 @@ static bool run_command(WOLFSSH *ssh, const char *line, bool terminal, bool *res
  * @brief Read an arrow key even when its bytes arrive in separate packets.
  * @param escape Part of an escape sequence that has already arrived.
  * @param key Next byte from the terminal.
- * @return A character, a history key, or SSH_KEY_IGNORE.
+ * @return A character, an arrow key, or SSH_KEY_IGNORE.
 */
 static int read_terminal_key(ssh_escape_t *escape, byte key)
 {
@@ -344,15 +360,14 @@ static int read_terminal_key(ssh_escape_t *escape, byte key)
         // Consume other escape keys so their letters do not enter the command.
         if (key >= 0x40 && key <= 0x7e)
         {
-            if (key == 'A')
+            switch (key)
             {
-                return SSH_KEY_UP;
+                case 'A': return SSH_KEY_UP;
+                case 'B': return SSH_KEY_DOWN;
+                case 'C': return SSH_KEY_RIGHT;
+                case 'D': return SSH_KEY_LEFT;
+                default: return SSH_KEY_IGNORE;
             }
-            if (key == 'B')
-            {
-                return SSH_KEY_DOWN;
-            }
-            return SSH_KEY_IGNORE;
         }
     }
     // Let the existing editor handle normal characters and control keys.
@@ -384,36 +399,96 @@ static void remember_command(ssh_history_t *history, const char *line, size_t le
 }
 
 /*
+ * @brief Find the screen row and column for a position in the command.
+ * @param offset Number of input characters before the cursor.
+ * @param length Number of input characters in the whole command.
+ * @param columns Width reported by the terminal.
+ * @return Screen position measured from the start of the prompt.
+*/
+static ssh_cursor_t terminal_position(size_t offset, size_t length, size_t columns)
+{
+    // The prompt occupies the first characters on the screen.
+    size_t cell = strlen(console_config.prompt) + offset;
+    // A full row still shows the cursor in its last column until more text arrives.
+    if (offset == length && cell != 0 && cell % columns == 0)
+    {
+        --cell;
+    }
+    const ssh_cursor_t position = { .row = cell / columns, .column = cell % columns };
+    return position;
+}
+
+/*
+ * @brief Move the displayed cursor between two positions in the same command.
+ * @param ssh Client connection.
+ * @param current Current cursor position.
+ * @param target Desired cursor position.
+ * @return true if the movement was sent or the cursor was already there.
+*/
+static bool move_terminal_cursor(WOLFSSH *ssh, ssh_cursor_t current, ssh_cursor_t target)
+{
+    // Avoid sending a movement when the visible position did not change.
+    if (current.row == target.row && current.column == target.column)
+    {
+        return true;
+    }
+    // Move up or down first when the command has wrapped onto another row.
+    char movement[40];
+    int length;
+    if (current.row != target.row)
+    {
+        const bool up = target.row < current.row;
+        const size_t rows = up ? current.row - target.row : target.row - current.row;
+        length = snprintf(movement, sizeof(movement), "\033[%zu%c\033[%zuG",
+                          rows, up ? 'A' : 'B', target.column + 1);
+    }
+    else
+    {
+        // On the same row, move only the number of columns needed.
+        const bool left = target.column < current.column;
+        const size_t columns = left ? current.column - target.column : target.column - current.column;
+        length = snprintf(movement, sizeof(movement), "\033[%zu%c", columns, left ? 'D' : 'C');
+    }
+    // Send the full movement as one update.
+    return length > 0 && (size_t)length < sizeof(movement) && send_bytes(ssh, movement, (size_t)length);
+}
+
+/*
  * @brief Clear the displayed input and redraw it from the prompt.
  * @param ssh Client connection.
+ * @param current Position of the visible cursor before the edit.
  * @param old_length Number of input characters previously shown.
- * @param line Input to display.
- * @param length Number of characters to display.
+ * @param line Updated input and cursor to display.
  * @param columns Width reported by the terminal.
  * @return true if the connection can still receive output.
 */
-static bool redraw_terminal_line(WOLFSSH *ssh, size_t old_length, const char *line,
-                                 size_t length, size_t columns)
+static bool redraw_terminal_line(WOLFSSH *ssh, ssh_cursor_t current, size_t old_length,
+                                 const ssh_line_t *line, size_t columns)
 {
     // Return to the first row before clearing a line that wrapped.
-    const size_t prompt_length = strlen(console_config.prompt);
-    const size_t printed = prompt_length + old_length;
-    const size_t wrapped_rows = printed == 0 ? 0 : (printed - 1) / columns;
-    if (wrapped_rows != 0)
+    if (current.row != 0)
     {
         char clear[32];
-        const int size = snprintf(clear, sizeof(clear), "\r\033[%zuA\033[J", wrapped_rows);
-        if (!send_bytes(ssh, clear, (size_t)size))
+        const int size = snprintf(clear, sizeof(clear), "\r\033[%zuA\033[J", current.row);
+        if (size <= 0 || (size_t)size >= sizeof(clear) || !send_bytes(ssh, clear, (size_t)size))
         {
             return false;
         }
     }
-    else if (!send_bytes(ssh, "\r\033[K", 4))
+    else
     {
-        return false;
+        // Clear all old rows when the cursor is in the first row of a wrapped command.
+        const bool wrapped = terminal_position(old_length, old_length, columns).row != 0;
+        if (!send_bytes(ssh, wrapped ? "\r\033[J" : "\r\033[K", 4))
+        {
+            return false;
+        }
     }
-    // Keep the cursor just after the input so editing can continue.
-    return send_bytes(ssh, console_config.prompt, prompt_length) && send_bytes(ssh, line, length);
+    // Print the revised command and return the cursor to the place being edited.
+    return send_bytes(ssh, console_config.prompt, strlen(console_config.prompt))
+            && send_bytes(ssh, line->text, line->length)
+            && move_terminal_cursor(ssh, terminal_position(line->length, line->length, columns),
+                                    terminal_position(line->cursor, line->length, columns));
 }
 
 /*
@@ -421,13 +496,12 @@ static bool redraw_terminal_line(WOLFSSH *ssh, size_t old_length, const char *li
  * @param ssh Client connection.
  * @param history Recent commands and the saved unfinished line.
  * @param key Up or Down history key.
- * @param line Input buffer to replace.
- * @param length Current line length, updated after a recall.
+ * @param line Input and cursor to replace.
  * @param columns Width reported by the terminal.
  * @return true if the connection can still receive output.
 */
 static bool recall_command(WOLFSSH *ssh, ssh_history_t *history, int key,
-                           char *line, size_t *length, size_t columns)
+                           ssh_line_t *line, size_t columns)
 {
     // Stop at the oldest entry or at the unfinished line.
     if ((key == SSH_KEY_UP && history->offset == history->count)
@@ -438,24 +512,23 @@ static bool recall_command(WOLFSSH *ssh, ssh_history_t *history, int key,
     if (history->offset == 0)
     {
         // Keep what was typed before the user entered the history list.
-        memcpy(history->draft, line, *length);
-        history->draft[*length] = '\0';
+        memcpy(history->draft, line->text, line->length);
+        history->draft[line->length] = '\0';
+        history->draft_cursor = line->cursor;
     }
     // Move one place in the list and find the corresponding slot.
     history->offset = key == SSH_KEY_UP ? history->offset + 1 : history->offset - 1;
     const size_t index = (history->next + HISTORY_CAPACITY - history->offset) % HISTORY_CAPACITY;
     const char *replacement = history->offset == 0 ? history->draft : history->commands[index];
 
-    // Show the recalled input before replacing the editor's copy.
-    const size_t replacement_length = strlen(replacement);
-    if (!redraw_terminal_line(ssh, *length, replacement, replacement_length, columns))
-    {
-        return false;
-    }
-    // Make the displayed command available for editing or Enter.
-    *length = replacement_length;
-    memcpy(line, replacement, replacement_length + 1);
-    return true;
+    // Remember where the cursor was before replacing the input.
+    const size_t old_length = line->length;
+    const ssh_cursor_t current = terminal_position(line->cursor, old_length, columns);
+    // Put the cursor at the end of a recalled command, or back where it was in the draft.
+    line->length = strlen(replacement);
+    line->cursor = history->offset == 0 ? history->draft_cursor : line->length;
+    memcpy(line->text, replacement, line->length + 1);
+    return redraw_terminal_line(ssh, current, old_length, line, columns);
 }
 
 /*
@@ -470,8 +543,7 @@ static bool run_terminal(WOLFSSH *ssh, size_t columns)
     ssh_history_t history = {0};
     ssh_escape_t escape = SSH_ESCAPE_NONE;
     // Keep room for one line of input and its ending zero byte.
-    char line[COMMAND_CAPACITY];
-    size_t length = 0;
+    ssh_line_t line = {0};
     // Remember when a long line has to be discarded.
     bool too_long = false;
     // Ignore a line feed immediately after a carriage return.
@@ -505,7 +577,24 @@ static bool run_terminal(WOLFSSH *ssh, size_t columns)
             if (key == SSH_KEY_UP || key == SSH_KEY_DOWN)
             {
                 // Do not turn an overlong input into a partial command.
-                if (!too_long && !recall_command(ssh, &history, key, line, &length, columns))
+                if (!too_long && !recall_command(ssh, &history, key, &line, columns))
+                {
+                    return false;
+                }
+                continue;
+            }
+            if (key == SSH_KEY_LEFT || key == SSH_KEY_RIGHT)
+            {
+                // Keep the cursor between the start and end of the command.
+                if (too_long || (key == SSH_KEY_LEFT && line.cursor == 0)
+                        || (key == SSH_KEY_RIGHT && line.cursor == line.length))
+                {
+                    continue;
+                }
+                // Move the displayed cursor along with the insertion point.
+                const ssh_cursor_t current = terminal_position(line.cursor, line.length, columns);
+                line.cursor = key == SSH_KEY_LEFT ? line.cursor - 1 : line.cursor + 1;
+                if (!move_terminal_cursor(ssh, current, terminal_position(line.cursor, line.length, columns)))
                 {
                     return false;
                 }
@@ -514,7 +603,10 @@ static bool run_terminal(WOLFSSH *ssh, size_t columns)
             // Finish the current line when Enter is pressed.
             if (key == '\r' || key == '\n')
             {
-                if (!send_bytes(ssh, "\r\n", 2))
+                // Start the reply below the last row even when editing an earlier row.
+                const ssh_cursor_t current = terminal_position(line.cursor, line.length, columns);
+                const ssh_cursor_t end = terminal_position(line.length, line.length, columns);
+                if (!move_terminal_cursor(ssh, current, end) || !send_bytes(ssh, "\r\n", 2))
                 {
                     return false;
                 }
@@ -527,26 +619,27 @@ static bool run_terminal(WOLFSSH *ssh, size_t columns)
                         return false;
                     }
                 }
-                else if (length != 0)
+                else if (line.length != 0)
                 {
                     // End the line and let 'exit' close the session.
-                    line[length] = '\0';
-                    if (strcmp(line, "exit") == 0)
+                    line.text[line.length] = '\0';
+                    if (strcmp(line.text, "exit") == 0)
                     {
                         return false;
                     }
                     // Keep the command before running it so Up can find it later.
-                    remember_command(&history, line, length);
+                    remember_command(&history, line.text, line.length);
                     // Finish sending the reply before applying a restart.
                     bool restart = false;
                     int status = 0;
-                    if (!run_command(ssh, line, true, &restart, &status) || restart)
+                    if (!run_command(ssh, line.text, true, &restart, &status) || restart)
                     {
                         return restart;
                     }
                 }
                 // Clear the line and get ready for the next command.
-                length = 0;
+                line.length = 0;
+                line.cursor = 0;
                 too_long = false;
                 history.offset = 0;
                 if (!send_bytes(ssh, console_config.prompt, prompt_size))
@@ -559,16 +652,15 @@ static bool run_terminal(WOLFSSH *ssh, size_t columns)
                 // Close cleanly when the client sends Ctrl+D or Ctrl+C.
                 return false;
             }
-            else if ((key == 8 || key == 127) && length > 0 && !too_long)
+            else if ((key == 8 || key == 127) && line.cursor > 0 && !too_long)
             {
-                // Remove the last character from the line and the screen.
-                --length;
-                // Redraw at a wrap boundary so the cursor stays on the right row.
-                const size_t column = (prompt_size + length) % columns;
-                const bool near_wrap = column == 0 || column == columns - 1;
-                const bool drawn = near_wrap ? redraw_terminal_line(ssh, length + 1, line, length, columns)
-                                             : send_bytes(ssh, "\b \b", 3);
-                if (!drawn)
+                // Remove the character before the cursor and move the rest of the command left.
+                const size_t old_length = line.length;
+                const ssh_cursor_t current = terminal_position(line.cursor, old_length, columns);
+                --line.cursor;
+                --line.length;
+                memmove(line.text + line.cursor, line.text + line.cursor + 1, line.length - line.cursor);
+                if (!redraw_terminal_line(ssh, current, old_length, &line, columns))
                 {
                     return false;
                 }
@@ -576,14 +668,22 @@ static bool run_terminal(WOLFSSH *ssh, size_t columns)
             else if (isprint(key))
             {
                 // Drop the whole line if it cannot fit.
-                if (length == sizeof(line) - 1)
+                if (line.length == sizeof(line.text) - 1)
                 {
                     too_long = true;
                     continue;
                 }
-                // Keep the character and show it in the terminal.
-                line[length++] = (char)key;
-                if (!send_bytes(ssh, &line[length - 1], 1))
+                // Insert the letter at the cursor and make room for the rest of the command.
+                const size_t old_length = line.length;
+                const ssh_cursor_t current = terminal_position(line.cursor, old_length, columns);
+                const bool append = line.cursor == old_length && (prompt_size + old_length) % columns != 0;
+                memmove(line.text + line.cursor + 1, line.text + line.cursor, old_length - line.cursor);
+                line.text[line.cursor++] = (char)key;
+                ++line.length;
+                // Send only the new letter when it fits after the last character.
+                const bool drawn = append ? send_bytes(ssh, &line.text[line.cursor - 1], 1)
+                                          : redraw_terminal_line(ssh, current, old_length, &line, columns);
+                if (!drawn)
                 {
                     return false;
                 }
